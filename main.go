@@ -2,7 +2,7 @@ package main
 
 import (
 	"log"
-	"pkd-bot/discord" // import your bot package
+	"atlantis_calc/discord" 
 )
 
 func main() {

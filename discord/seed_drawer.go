@@ -9,7 +9,7 @@ import (
 	"os"
 	"strings"
 
-	"pkd-bot/calc"
+	"atlantis_calc/calc"
 
 	"github.com/fogleman/gg"
 	log "github.com/sirupsen/logrus"

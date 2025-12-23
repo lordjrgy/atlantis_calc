@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"pkd-bot/calc"
+	"atlantis_calc/calc"
 
 	"github.com/bwmarrin/discordgo"
 	log "github.com/sirupsen/logrus"

@@ -1,4 +1,4 @@
-module pkd-bot
+module atlantis_calc
 
 go 1.22.2
 

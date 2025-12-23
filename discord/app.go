@@ -152,127 +152,12 @@ func tournamentHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	}
 
 	content := ""
-
-	switch options[0].Name {
-	case "register":
-		registerTournamentHandler(s, i)
-		return
-	default:
-		content = "There is no such command"
-	}
-
 	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{
 			Content: content,
 		},
 	})
-}
-
-func registerTournamentHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	// First, respond asking for the CSV file
-	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-		Type: discordgo.InteractionResponseChannelMessageWithSource,
-		Data: &discordgo.InteractionResponseData{
-			Content: "Please provide a CSV file with the tournament participants in your next message.",
-		},
-	})
-	if err != nil {
-		log.Errorf("Failed to send initial response: %v", err)
-		return
-	}
-
-	// Create a message handler to wait for the CSV file
-	s.AddHandlerOnce(func(s *discordgo.Session, m *discordgo.MessageCreate) {
-		log.Debugf("%+v", m.Embeds)
-		// Ensure it's from the same user and channel
-		if m.Author.ID != i.Member.User.ID || m.ChannelID != i.ChannelID {
-			return
-		}
-
-		// Check if there's an attachment
-		if len(m.Attachments) == 0 {
-			s.ChannelMessageSend(m.ChannelID, "Please attach a CSV file.")
-			return
-		}
-
-		attachment := m.Attachments[0]
-		if !strings.HasSuffix(strings.ToLower(attachment.Filename), ".csv") {
-			s.ChannelMessageSend(m.ChannelID, "The attached file must be a CSV file.")
-			return
-		}
-
-		resp, err := http.Get(attachment.URL)
-		if err != nil {
-			log.Warnf("Failed to download attachment: %v", err)
-			s.ChannelMessageSend(m.ChannelID, "Failed to download the attachment. Please try again.")
-			return
-		}
-		defer resp.Body.Close()
-
-		fileContent, err := io.ReadAll(resp.Body)
-		if err != nil {
-			log.Errorf("Failed to read attachment content: %v", err)
-			s.ChannelMessageSend(m.ChannelID, "Failed to read the attachment. Please try again.")
-			return
-		}
-
-		if err := tournaments.RegisterTournamentFromCsv(fileContent); err != nil {
-			log.Errorf("Failed to register tournament: %v", err)
-			s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Failed to register tournament: %v", err))
-			return
-		}
-
-		s.ChannelMessageSend(m.ChannelID, "Tournament successfully registered!")
-	})
-}
-
-func playercountHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	logUserInteraction(i, "command", "playercount")
-
-	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
-		Data: &discordgo.InteractionResponseData{},
-	})
-	if err != nil {
-		log.Errorf("Failed to defer response: %v", err)
-		return
-	}
-
-	playerCount, err := hypixel.GetPlayerCount()
-	content := "Failed to fetch player count from Hypixel API. Please try again later."
-	if err != nil {
-		log.Errorf("Failed to get player count: %v", err)
-		_, err = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
-			Content: &content,
-		})
-		if err != nil {
-			log.Errorf("Failed to edit response with error message: %v", err)
-		}
-		return
-	}
-
-	embed := &discordgo.MessageEmbed{
-		Title: "Parkour Duels",
-		Color: 0x45D3B3,
-		Thumbnail: &discordgo.MessageEmbedThumbnail{
-			URL: "https://static.wikia.nocookie.net/hypixel-skyblock/images/5/5c/Hypixel_Logo.png/revision/latest/scale-to-width-down/250",
-		},
-		Fields: []*discordgo.MessageEmbedField{
-			{
-				Name:   "Current player count",
-				Value:  fmt.Sprintf("**%d**", playerCount),
-				Inline: false,
-			},
-		},
-	}
-
-	_, err = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
-		Embeds: &[]*discordgo.MessageEmbed{embed},
-	})
-	if err != nil {
-		log.Errorf("Failed to edit response with player count: %v", err)
-	}
 }
 
 var commandHandlers = map[string]func(s *discordgo.Session, i *discordgo.InteractionCreate){
@@ -284,9 +169,7 @@ var commandHandlers = map[string]func(s *discordgo.Session, i *discordgo.Interac
 			},
 		})
 	},
-	"tournament":  tournamentHandler,
 	"calc":        calcSeedHandler,
-	"playercount": playercountHandler,
 	"allsplits":   allSplitsHandler,
 	"roomsplits":  roomSplitsHandler,
 }
