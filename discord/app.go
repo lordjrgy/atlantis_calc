@@ -14,9 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"pkd-bot/calc"
-	"pkd-bot/hypixel"
-	"pkd-bot/tournaments"
+	"atlantis_calc/calc"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/joho/godotenv"
