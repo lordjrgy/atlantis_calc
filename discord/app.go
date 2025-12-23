@@ -1,0 +1,1656 @@
+package discord
+
+import (
+	"bytes"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/signal"
+	"slices"
+	"sort"
+	"strings"
+	"time"
+
+	"regexp"
+	"strconv"
+
+	"pkd-bot/calc"
+
+	"pkd-bot/hypixel"
+	"pkd-bot/tournaments"
+
+	"github.com/bwmarrin/discordgo"
+	"github.com/joho/godotenv"
+	log "github.com/sirupsen/logrus"
+)
+
+func StartDiscordBot() error {
+	slices.Sort(roomOptions)
+
+	log.SetReportCaller(true)
+	s.AddHandler(func(s *discordgo.Session, r *discordgo.Ready) {
+		log.Infof("Logged in as %v#%v", s.State.User.Username, s.State.User.Discriminator)
+	})
+
+	s.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
+		switch i.Type {
+		case discordgo.InteractionApplicationCommand:
+			if h, ok := commandHandlers[i.ApplicationCommandData().Name]; ok {
+				h(s, i)
+			}
+		case discordgo.InteractionApplicationCommandAutocomplete:
+			autocompleteHandler(s, i)
+		case discordgo.InteractionMessageComponent:
+			buttonHandler(s, i)
+		}
+	})
+
+	err := s.Open()
+	if err != nil {
+		log.Errorf("Cannot open the session: %v", err)
+		return err
+	}
+
+	logBotPermissions()
+
+	log.Info("Adding commands...")
+	registeredCommands := make([]*discordgo.ApplicationCommand, len(commands))
+	for i, v := range commands {
+		cmd, err := s.ApplicationCommandCreate(s.State.User.ID, "", v)
+		if err != nil {
+			log.Errorf("Cannot create '%v' command: %v", v.Name, err)
+			return err
+		}
+		registeredCommands[i] = cmd
+	}
+
+	defer s.Close()
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt)
+	log.Info("Press Ctrl+C to exit")
+	<-stop
+
+	log.Info("Shutting down...")
+
+	return nil
+}
+
+var (
+	BotToken = ""
+	GuildID  = ""
+)
+
+var s *discordgo.Session
+
+func init() {
+	if err := godotenv.Load(); err != nil {
+		log.Fatalf("failed to open .env")
+	}
+
+	BotToken = os.Getenv("BOT_TOKEN")
+	GuildID = os.Getenv("GUILD_ID")
+
+	if os.Getenv("DEBUG") == "true" {
+		log.SetLevel(log.DebugLevel)
+	}
+
+	var err error
+	s, err = discordgo.New("Bot " + BotToken)
+	if err != nil {
+		log.Fatalf("Invalid bot token, couldn't initiate a session: %v", err)
+	}
+}
+
+var commands = []*discordgo.ApplicationCommand{
+	{
+		Name:        "calc",
+		Description: "Choose 8 rooms",
+		Options:     generateOptions(),
+	},
+	{
+		Name:        "playercount",
+		Description: "Find out the current player count in PKD!",
+	},
+	{
+		Name:        "allsplits",
+		Description: "Check splits that are used in the calc",
+	},
+	{
+		Name:        "roomsplits",
+		Description: "Display detailed splits for a specific room",
+		Options: []*discordgo.ApplicationCommandOption{
+			{
+				Type:         discordgo.ApplicationCommandOptionString,
+				Name:         "room",
+				Description:  "The room to display splits for",
+				Required:     true,
+				Autocomplete: true,
+			},
+		},
+	},
+}
+
+func tournamentHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	if i.Type != discordgo.InteractionApplicationCommand {
+		err := fmt.Errorf("expected interaction type to be InteractionApplicationCommand, but found %v", i.Type)
+		log.Warn(err)
+
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "I'm sorry, I broke down. Please tell my developer that he's an idiot and he'll fix me.",
+			},
+		})
+		return
+	}
+
+	options := i.ApplicationCommandData().Options
+	if len(options) == 0 {
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "You sent an incomplete command.", // TODO: need to send suggestions to the user on what to do next
+			},
+		})
+	}
+
+	content := ""
+
+	switch options[0].Name {
+	case "register":
+		registerTournamentHandler(s, i)
+		return
+	default:
+		content = "There is no such command"
+	}
+
+	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Content: content,
+		},
+	})
+}
+
+func registerTournamentHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	// First, respond asking for the CSV file
+	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Content: "Please provide a CSV file with the tournament participants in your next message.",
+		},
+	})
+	if err != nil {
+		log.Errorf("Failed to send initial response: %v", err)
+		return
+	}
+
+	// Create a message handler to wait for the CSV file
+	s.AddHandlerOnce(func(s *discordgo.Session, m *discordgo.MessageCreate) {
+		log.Debugf("%+v", m.Embeds)
+		// Ensure it's from the same user and channel
+		if m.Author.ID != i.Member.User.ID || m.ChannelID != i.ChannelID {
+			return
+		}
+
+		// Check if there's an attachment
+		if len(m.Attachments) == 0 {
+			s.ChannelMessageSend(m.ChannelID, "Please attach a CSV file.")
+			return
+		}
+
+		attachment := m.Attachments[0]
+		if !strings.HasSuffix(strings.ToLower(attachment.Filename), ".csv") {
+			s.ChannelMessageSend(m.ChannelID, "The attached file must be a CSV file.")
+			return
+		}
+
+		resp, err := http.Get(attachment.URL)
+		if err != nil {
+			log.Warnf("Failed to download attachment: %v", err)
+			s.ChannelMessageSend(m.ChannelID, "Failed to download the attachment. Please try again.")
+			return
+		}
+		defer resp.Body.Close()
+
+		fileContent, err := io.ReadAll(resp.Body)
+		if err != nil {
+			log.Errorf("Failed to read attachment content: %v", err)
+			s.ChannelMessageSend(m.ChannelID, "Failed to read the attachment. Please try again.")
+			return
+		}
+
+		if err := tournaments.RegisterTournamentFromCsv(fileContent); err != nil {
+			log.Errorf("Failed to register tournament: %v", err)
+			s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Failed to register tournament: %v", err))
+			return
+		}
+
+		s.ChannelMessageSend(m.ChannelID, "Tournament successfully registered!")
+	})
+}
+
+func playercountHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	logUserInteraction(i, "command", "playercount")
+
+	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{},
+	})
+	if err != nil {
+		log.Errorf("Failed to defer response: %v", err)
+		return
+	}
+
+	playerCount, err := hypixel.GetPlayerCount()
+	content := "Failed to fetch player count from Hypixel API. Please try again later."
+	if err != nil {
+		log.Errorf("Failed to get player count: %v", err)
+		_, err = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+			Content: &content,
+		})
+		if err != nil {
+			log.Errorf("Failed to edit response with error message: %v", err)
+		}
+		return
+	}
+
+	embed := &discordgo.MessageEmbed{
+		Title: "Parkour Duels",
+		Color: 0x45D3B3,
+		Thumbnail: &discordgo.MessageEmbedThumbnail{
+			URL: "https://static.wikia.nocookie.net/hypixel-skyblock/images/5/5c/Hypixel_Logo.png/revision/latest/scale-to-width-down/250",
+		},
+		Fields: []*discordgo.MessageEmbedField{
+			{
+				Name:   "Current player count",
+				Value:  fmt.Sprintf("**%d**", playerCount),
+				Inline: false,
+			},
+		},
+	}
+
+	_, err = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+		Embeds: &[]*discordgo.MessageEmbed{embed},
+	})
+	if err != nil {
+		log.Errorf("Failed to edit response with player count: %v", err)
+	}
+}
+
+var commandHandlers = map[string]func(s *discordgo.Session, i *discordgo.InteractionCreate){
+	"basic-command": func(s *discordgo.Session, i *discordgo.InteractionCreate) {
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "Hey there! Congratulations, you just executed your first slash command",
+			},
+		})
+	},
+	"tournament":  tournamentHandler,
+	"calc":        calcSeedHandler,
+	"playercount": playercountHandler,
+	"allsplits":   allSplitsHandler,
+	"roomsplits":  roomSplitsHandler,
+}
+
+func roomSplitsHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	logUserInteraction(i, "command", "roomsplits")
+
+	// Get room name from interaction
+	options := i.ApplicationCommandData().Options
+	if len(options) == 0 {
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "Please specify a room name.",
+			},
+		})
+		return
+	}
+
+	// Get room name from command options
+	roomName := options[0].StringValue()
+
+	// Respond with deferred message while we prepare the data
+	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{},
+	})
+	if err != nil {
+		log.Errorf("Failed to defer response: %v", err)
+		return
+	}
+
+	// Check if room exists
+	roomInfo, exists := calc.RoomMap[roomName]
+	if !exists {
+		// Try to find a similar room name if exact match not found
+		bestMatch, score := fuzzyMatch(roomName, roomOptions)
+		if score >= 0.6 {
+			roomName = bestMatch
+			roomInfo = calc.RoomMap[bestMatch]
+		} else {
+			content := fmt.Sprintf("Room '%s' not found. Try using the autocomplete feature.", roomName)
+			_, err = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+				Content: &content,
+			})
+			return
+		}
+	}
+
+	// Create embed with detailed room information
+	embed := createRoomDetailEmbed(roomName, roomInfo)
+
+	// Send the response
+	_, err = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+		Embeds: &[]*discordgo.MessageEmbed{embed},
+	})
+	if err != nil {
+		log.Errorf("Failed to edit response with room details: %v", err)
+	}
+}
+
+func createRoomDetailEmbed(roomName string, room calc.Room) *discordgo.MessageEmbed {
+	var description strings.Builder
+
+	description.WriteString("**Split Times:**\n")
+	description.WriteString("```\n")
+	description.WriteString(fmt.Sprintf("Boostless Time: %8.2f seconds\n", room.BoostlessTime))
+
+	if len(room.BoostStrats) > 0 {
+		description.WriteString("\nBoost Strategies:\n")
+		description.WriteString(fmt.Sprintf("%-20s %12s %12s\n",
+			"Strat", "Total Time", "Boost At"))
+		description.WriteString(strings.Repeat("-", 50) + "\n")
+
+		for _, strat := range room.BoostStrats {
+			description.WriteString(fmt.Sprintf("%-20s %12.2f %12.2f\n",
+				strat.Name, strat.Time, strat.BoostTime))
+		}
+	} else {
+		description.WriteString("\nNo boost strategies available for this room.")
+	}
+	description.WriteString("```\n")
+
+	embed := &discordgo.MessageEmbed{
+		Title:       fmt.Sprintf("Room Details: %s", roomName),
+		Description: description.String(),
+		Color:       0x45D3B3,
+	}
+
+	return embed
+}
+
+var roomOptions = calc.GetRooms()
+
+func generateOptions() []*discordgo.ApplicationCommandOption {
+	var params []*discordgo.ApplicationCommandOption
+	for i := 1; i <= 8; i++ {
+		params = append(params, &discordgo.ApplicationCommandOption{
+			Type:         discordgo.ApplicationCommandOptionString,
+			Name:         fmt.Sprintf("room_%d", i),
+			Description:  fmt.Sprintf("Choose option for room %d", i),
+			Required:     true,
+			Autocomplete: true,
+		})
+	}
+	return params
+}
+
+const (
+	ButtonPrevious        = "previous"
+	ButtonNext            = "next"
+	ButtonTwoBoost        = "two_boost"
+	ButtonThreeBoost      = "three_boost"
+	ButtonAnyBoost        = "any_boost"
+	ButtonShowCalc        = "show_calculation"
+	ButtonCopyCalcCommand = "copy_calc_command"
+)
+
+func createNavigationButtons(currentIndex, totalResults int, currentFilter string) []discordgo.MessageComponent {
+	return []discordgo.MessageComponent{
+		discordgo.ActionsRow{
+			Components: []discordgo.MessageComponent{
+				discordgo.Button{
+					CustomID: ButtonPrevious,
+					Style:    discordgo.SecondaryButton,
+					Emoji: &discordgo.ComponentEmoji{
+						Name: "⬅️",
+					},
+					Disabled: currentIndex <= 0,
+				},
+				discordgo.Button{
+					CustomID: ButtonNext,
+					Style:    discordgo.SecondaryButton,
+					Emoji: &discordgo.ComponentEmoji{
+						Name: "➡️",
+					},
+					Disabled: currentIndex >= totalResults-1,
+				},
+			},
+		},
+		discordgo.ActionsRow{
+			Components: []discordgo.MessageComponent{
+				discordgo.Button{
+					CustomID: ButtonTwoBoost,
+					Label:    "2 Boost",
+					Style: func() discordgo.ButtonStyle {
+						if currentFilter == ButtonTwoBoost {
+							return discordgo.PrimaryButton
+						}
+						return discordgo.SecondaryButton
+					}(),
+				},
+				discordgo.Button{
+					CustomID: ButtonThreeBoost,
+					Label:    "3 Boost",
+					Style: func() discordgo.ButtonStyle {
+						if currentFilter == ButtonThreeBoost {
+							return discordgo.PrimaryButton
+						}
+						return discordgo.SecondaryButton
+					}(),
+				},
+				discordgo.Button{
+					CustomID: ButtonAnyBoost,
+					Label:    "Any Boost",
+					Style: func() discordgo.ButtonStyle {
+						if currentFilter == ButtonAnyBoost {
+							return discordgo.PrimaryButton
+						}
+						return discordgo.SecondaryButton
+					}(),
+				},
+			},
+		},
+		discordgo.ActionsRow{
+			Components: []discordgo.MessageComponent{
+				discordgo.Button{
+					CustomID: ButtonShowCalc,
+					Label:    "How did you get this?",
+					Style:    discordgo.SuccessButton,
+				},
+			},
+		},
+	}
+}
+
+type ResultState struct {
+	Rooms       []string
+	Results     []calc.CalcSeedResult
+	Index       int
+	Filter      string
+	CalcCommand string
+}
+
+var messageStates = make(map[string]*ResultState)
+
+var cleanupTimers = make(map[string]*time.Timer)
+
+var showCalcMessages = make(map[string]string)
+
+var (
+	showCalcTimers     = make(map[string]*time.Timer)
+	longButtonDuration = 5 * time.Minute
+)
+
+func cleanupMessageState(messageID string, s *discordgo.Session, channelID string, keepShowCalcButton bool) *time.Timer {
+	return time.AfterFunc(5*time.Minute, func() {
+		message, err := s.ChannelMessage(channelID, messageID)
+		if err != nil {
+			log.Errorf("Failed to get message for cleanup: %v", err)
+			return
+		}
+
+		if len(message.Attachments) == 0 {
+			log.Error("No attachments found in message")
+			return
+		}
+
+		resp, err := http.Get(message.Attachments[0].URL)
+		if err != nil {
+			log.Errorf("Failed to get attachment: %v", err)
+			return
+		}
+		defer resp.Body.Close()
+
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			log.Errorf("Failed to read attachment data: %v", err)
+			return
+		}
+
+		var components []discordgo.MessageComponent
+		if keepShowCalcButton {
+			// Keep only the ShowCalc button
+			components = []discordgo.MessageComponent{
+				discordgo.ActionsRow{
+					Components: []discordgo.MessageComponent{
+						discordgo.Button{
+							CustomID: ButtonShowCalc,
+							Label:    "How did you get this?",
+							Style:    discordgo.SuccessButton,
+						},
+					},
+				},
+			}
+
+			// Create a timer to remove the ShowCalc button and state eventually
+			showCalcTimers[messageID] = time.AfterFunc(5*time.Minute, func() {
+				// Remove all buttons after the extended period
+				_, err = s.ChannelMessageEditComplex(&discordgo.MessageEdit{
+					ID:          messageID,
+					Channel:     channelID,
+					Files:       []*discordgo.File{{Name: "result.png", Reader: bytes.NewReader(data)}},
+					Components:  &[]discordgo.MessageComponent{},
+					Attachments: &[]*discordgo.MessageAttachment{},
+				})
+				if err != nil {
+					log.Errorf("Failed to remove ShowCalc button: %v", err)
+				}
+				delete(showCalcTimers, messageID)
+				delete(messageStates, messageID) // Only delete state when fully done
+			})
+		} else {
+			components = []discordgo.MessageComponent{}
+			// If not keeping the button, remove the state now
+			delete(messageStates, messageID)
+		}
+
+		// Keep the last image but remove/modify buttons
+		_, err = s.ChannelMessageEditComplex(&discordgo.MessageEdit{
+			ID:          messageID,
+			Channel:     channelID,
+			Files:       []*discordgo.File{{Name: "result.png", Reader: bytes.NewReader(data)}},
+			Components:  &components,
+			Attachments: &[]*discordgo.MessageAttachment{},
+		})
+		if err != nil {
+			log.Errorf("Failed to update buttons: %v", err)
+		}
+
+		delete(messageStates, messageID)
+		delete(showCalcMessages, messageID)
+		delete(cleanupTimers, messageID)
+		// NOTE: We don't delete messageStates here if keepShowCalcButton is true
+	})
+}
+
+func buttonHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	logUserInteraction(i, "button click", i.MessageComponentData().CustomID)
+
+	defer func() {
+		if err := recover(); err != nil {
+			log.Errorf("application panicked while handling a request: %v", err)
+			s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+				Type: discordgo.InteractionResponseChannelMessageWithSource,
+				Data: &discordgo.InteractionResponseData{
+					Content: "HA. Buttons not working.",
+				},
+			})
+		}
+	}()
+
+	state, exists := messageStates[i.Message.ID]
+	if !exists {
+		content := "This interaction has expired. Please run the command again."
+		_, err := s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+			Content:    &content,
+			Components: &[]discordgo.MessageComponent{},
+		})
+		if err != nil {
+			log.Errorf("Failed to edit expired interaction message: %v", err)
+		}
+		return
+	}
+
+	// Acknowledge the interaction first
+	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseDeferredMessageUpdate,
+	})
+	if err != nil {
+		log.Errorf("Failed to acknowledge interaction: %v", err)
+		return
+	}
+
+	// Reset timers if they exist
+	if timer, exists := cleanupTimers[i.Message.ID]; exists {
+		timer.Reset(5 * time.Minute)
+	}
+	if timer, exists := showCalcTimers[i.Message.ID]; exists {
+		timer.Reset(longButtonDuration)
+	}
+
+	// Handle button actions
+	switch i.MessageComponentData().CustomID {
+	case "allsplits_filter":
+		selected := i.MessageComponentData().Values[0] // "all", "easy", or "hard"
+		embed := createAllSplitsSummaryEmbed(selected)
+		_, err := s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+			Embeds: &[]*discordgo.MessageEmbed{embed},
+		})
+		if err != nil {
+			log.Errorf("Failed to update allsplits embed: %v", err)
+		}
+		return
+
+	case ButtonCopyCalcCommand:
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: fmt.Sprintf("```%s```\nCopy the command above to use with the PKD Bot!", state.CalcCommand),
+				Flags:   discordgo.MessageFlagsEphemeral,
+			},
+		})
+		return
+
+	case ButtonShowCalc:
+		var result calc.CalcSeedResult
+		filteredResults := getFilteredResults(state)
+		if len(filteredResults) > 0 {
+			if state.Index < len(filteredResults) {
+				result = filteredResults[state.Index]
+			} else {
+				result = filteredResults[0]
+			}
+		} else {
+			result = state.Results[0]
+		}
+
+		detailedCalc := formatDetailedCalculation(state.Rooms, result)
+
+		if calcMsgID, exists := showCalcMessages[i.Message.ID]; exists {
+			_, err = s.ChannelMessageEdit(i.ChannelID, calcMsgID, detailedCalc)
+			if err != nil {
+				log.Errorf("Failed to edit calculation message: %v", err)
+				delete(showCalcMessages, i.Message.ID)
+				msg, err := s.ChannelMessageSend(i.ChannelID, detailedCalc)
+				if err == nil {
+					showCalcMessages[i.Message.ID] = msg.ID
+				} else {
+					log.Errorf("Failed to send calculation details: %v", err)
+				}
+			}
+		} else {
+			msg, err := s.ChannelMessageSend(i.ChannelID, detailedCalc)
+			if err != nil {
+				log.Errorf("Failed to send calculation details: %v", err)
+			} else {
+				showCalcMessages[i.Message.ID] = msg.ID
+			}
+		}
+
+		_, err = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{})
+		if err != nil {
+			log.Errorf("Failed to edit interaction response: %v", err)
+		}
+		return
+
+	case "allsplits_all", "allsplits_easy", "allsplits_hard":
+		filter := ""
+		switch i.MessageComponentData().CustomID {
+		case "allsplits_all":
+			filter = "all"
+		case "allsplits_easy":
+			filter = "Easy"
+		case "allsplits_hard":
+			filter = "Hard"
+		}
+
+		embed := createAllSplitsSummaryEmbed(filter)
+		buttons := discordgo.ActionsRow{
+			Components: []discordgo.MessageComponent{
+				discordgo.Button{Label: "All", Style: discordgo.SecondaryButton, CustomID: "allsplits_all"},
+				discordgo.Button{Label: "Easy", Style: discordgo.SecondaryButton, CustomID: "allsplits_easy"},
+				discordgo.Button{Label: "Hard", Style: discordgo.SecondaryButton, CustomID: "allsplits_hard"},
+			},
+		}
+
+		// Highlight selected button
+		for idx, comp := range buttons.Components {
+			if btn, ok := comp.(discordgo.Button); ok {
+				switch filter {
+				case "all":
+					if idx == 0 {
+						btn.Style = discordgo.PrimaryButton
+					}
+				case "Easy":
+					if idx == 1 {
+						btn.Style = discordgo.PrimaryButton
+					}
+				case "Hard":
+					if idx == 2 {
+						btn.Style = discordgo.PrimaryButton
+					}
+				}
+				buttons.Components[idx] = btn // put the modified button back
+			}
+		}
+
+
+		_, err := s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+			Embeds:     &[]*discordgo.MessageEmbed{embed},
+			Components: &[]discordgo.MessageComponent{buttons},
+		})
+		if err != nil {
+			log.Errorf("Failed to update allsplits embed: %v", err)
+		}
+		return
+
+	case ButtonTwoBoost, ButtonThreeBoost, ButtonAnyBoost:
+		state.Filter = i.MessageComponentData().CustomID
+		state.Index = 0
+	}
+
+	// Handle general result drawing
+	filteredResults := getFilteredResults(state)
+	if len(filteredResults) == 0 {
+		log.Error("No results available after filtering")
+		return
+	}
+
+	currentResult := []calc.CalcSeedResult{filteredResults[state.Index]}
+	img, err := drawCalcResults(state.Rooms, currentResult)
+	if err != nil {
+		log.Error(err)
+		return
+	}
+
+	navButtons := createNavigationButtons(state.Index, len(filteredResults), state.Filter)
+	_, err = s.ChannelMessageEditComplex(&discordgo.MessageEdit{
+		ID:          i.Message.ID,
+		Channel:     i.ChannelID,
+		Files:       []*discordgo.File{{Name: "result.png", Reader: bytes.NewReader(img.Bytes())}},
+		Components:  &navButtons,
+		Attachments: &[]*discordgo.MessageAttachment{},
+	})
+	if err != nil {
+		log.Errorf("Failed to update message: %v", err)
+		return
+	}
+
+	_, err = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{})
+	if err != nil {
+		log.Errorf("Failed to edit interaction response: %v", err)
+	}
+
+	messageStates[i.Message.ID] = state
+}
+
+
+func formatDetailedCalculation(rooms []string, result calc.CalcSeedResult) string {
+	rooms = append(rooms, "finish room")
+
+	var boostCalc, boostlessCalc strings.Builder
+
+	maxRoomNameLength := 0
+	for _, room := range rooms {
+		if len(room) > maxRoomNameLength {
+			maxRoomNameLength = len(room)
+		}
+	}
+
+	boostCalc.WriteString("**Boost time calculation:**\n```\n")
+	boostlessCalc.WriteString("**Boostless time calculation:**\n```\n")
+
+	formatStr := "%-" + fmt.Sprintf("%d", maxRoomNameLength+1) + "s: %6.2f"
+
+	boostTimeSum := 0.0
+	boostlessTimeSum := 0.0
+
+	boostRooms := make(map[int]calc.CalcResultBoost)
+	for _, br := range result.BoostRooms {
+		boostRooms[br.Ind] = br
+	}
+
+	for i, room := range rooms {
+		roomInfo := calc.RoomMap[room]
+
+		boostlessTime := roomInfo.BoostlessTime
+		boostlessTimeSum += boostlessTime
+		boostlessCalc.WriteString(fmt.Sprintf(formatStr, room, boostlessTime))
+
+		var boostLine strings.Builder
+
+		if boost, isBoost := boostRooms[i]; isBoost {
+			boostTime := roomInfo.BoostStrats[boost.StratInd].Time
+			boostStart := roomInfo.BoostStrats[boost.StratInd].BoostTime
+			boostTimeSum += boostTime
+
+			boostLine.WriteString(fmt.Sprintf(formatStr, room, boostStart))
+
+			boostLine.WriteString(fmt.Sprintf(" (before boost) + %5.2f", boostTime-boostStart))
+
+			if boost.Pacelock > 0 {
+				boostLine.WriteString(fmt.Sprintf(" + %5.2f (pacelock)", boost.Pacelock))
+				boostTimeSum += boost.Pacelock
+			}
+		} else {
+			boostTime := roomInfo.BoostlessTime
+			boostTimeSum += boostTime
+			boostLine.WriteString(fmt.Sprintf(formatStr, room, boostTime))
+		}
+
+		boostCalc.WriteString(boostLine.String())
+
+		if i == 0 {
+			boostlessCalc.WriteString(fmt.Sprintf(" - %5.2f (accounting for r1)", 0.3))
+			boostCalc.WriteString(fmt.Sprintf(" - %5.2f (accounting for r1)", 0.3))
+
+			boostlessTimeSum -= 0.3
+			boostTimeSum -= 0.3
+		} else {
+			prevRoom := rooms[i-1]
+
+			if prevRoom == "four towers" {
+				boostlessCalc.WriteString(fmt.Sprintf(" - %5.2f (four towers timesave)", 0.2))
+				boostCalc.WriteString(fmt.Sprintf(" - %5.2f (four towers timesave)", 0.2))
+
+				boostlessTimeSum -= 0.2
+				boostTimeSum -= 0.2
+			}
+
+			if prevRoom == "sandpit" || prevRoom == "castle wall" {
+				boostlessCalc.WriteString(fmt.Sprintf(" - %5.2f (ib hh)", 0.1))
+				boostCalc.WriteString(fmt.Sprintf(" - %5.2f (ib hh)", 0.1))
+
+				boostlessTimeSum -= 0.1
+				boostTimeSum -= 0.1
+			}
+
+			if prevRoom == "early 3+1" {
+				for _, boost := range boostRooms {
+					if boost.Ind == i-1 && boost.StratInd == 1 {
+						boostCalc.WriteString(fmt.Sprintf(" - %5.2f (early 3+1 boost timesave)", 0.5))
+
+						boostTimeSum -= 0.5
+						break
+					}
+				}
+			}
+
+			if prevRoom == "underbridge" {
+				for _, boost := range boostRooms {
+					if boost.Ind == i-1 && boost.StratInd == 1 {
+						boostCalc.WriteString(fmt.Sprintf(" - %5.2f (underbridge boost timesave)", 0.2))
+
+						boostTimeSum -= 0.2
+						break
+					}
+				}
+			}
+		}
+
+		if i < len(rooms)-1 {
+			boostCalc.WriteString("\n")
+			boostlessCalc.WriteString("\n")
+		}
+	}
+
+	separatorLine := strings.Repeat("-", maxRoomNameLength+20)
+
+	boostCalc.WriteString(fmt.Sprintf("\n%s\nTotal: %6.2f seconds = %s\n", separatorLine, boostTimeSum, FormatTime(boostTimeSum)))
+	boostCalc.WriteString("```\n")
+
+	boostlessCalc.WriteString(fmt.Sprintf("\n%s\nTotal: %6.2f seconds = %s\n", separatorLine, boostlessTimeSum, FormatTime(boostlessTimeSum)))
+	boostlessCalc.WriteString("```")
+
+	timeSaved := boostlessTimeSum - boostTimeSum
+	var comparisonText string
+	if timeSaved > 0 {
+		comparisonText = fmt.Sprintf("**Time saved with boosts: %.2f seconds**", timeSaved)
+	} else {
+		comparisonText = fmt.Sprintf("**Warning: Boosts are slower by %.2f seconds than boostless!**", -timeSaved)
+	}
+
+	return boostCalc.String() + "\n" + boostlessCalc.String() + "\n\n" + comparisonText
+}
+
+func getFilteredResults(state *ResultState) []calc.CalcSeedResult {
+	if state.Filter == ButtonAnyBoost {
+		return state.Results
+	}
+
+	filteredResults := make([]calc.CalcSeedResult, 0)
+	for _, result := range state.Results {
+		boostCount := len(result.BoostRooms)
+		switch state.Filter {
+		case ButtonTwoBoost:
+			if boostCount == 2 {
+				filteredResults = append(filteredResults, result)
+			}
+		case ButtonThreeBoost:
+			if boostCount == 3 {
+				filteredResults = append(filteredResults, result)
+			}
+		}
+	}
+	return filteredResults
+}
+
+func validateInput(input []string) (bool, error) {
+	log.Info(roomOptions)
+
+	if len(input) != 8 {
+		err := fmt.Errorf("Was expecting 8 rooms, got %d", len(input))
+		log.Error(err)
+		return false, err
+	}
+
+	correctedInput := make([]string, len(input))
+	copy(correctedInput, input)
+
+	for i, roomName := range input {
+		if slices.Contains(roomOptions, roomName) {
+			continue
+		}
+
+		bestMatch, score := fuzzyMatch(roomName, roomOptions)
+
+		if score >= 0.6 {
+			log.Infof("Autocorrected '%s' to '%s' (score: %.2f)", roomName, bestMatch, score)
+			correctedInput[i] = bestMatch
+		} else {
+			err := fmt.Errorf("I don't know a room called \"%s\". Did you mean \"%s\"?", roomName, bestMatch)
+			log.Error(err)
+			return false, err
+		}
+	}
+
+	seen := make(map[string]bool)
+	for _, room := range correctedInput {
+		if seen[room] {
+			err := fmt.Errorf("Room '%s' appears more than once. Each room must be unique", room)
+			log.Error(err)
+			return false, err
+		}
+		seen[room] = true
+	}
+
+	copy(input, correctedInput)
+	return true, nil
+}
+
+func fuzzyMatch(input string, options []string) (string, float64) {
+	input = strings.ToLower(input)
+	bestMatch := ""
+	bestScore := 0.0
+
+	for _, option := range options {
+		// Calculate match score
+		score := calculateSimilarity(input, option)
+
+		// Also check if the input is a prefix or substring
+		optionLower := strings.ToLower(option)
+		if strings.HasPrefix(optionLower, input) {
+			// Prefix matches get a bonus
+			score += 0.2
+		} else if strings.Contains(optionLower, input) {
+			// Substring matches get a smaller bonus
+			score += 0.1
+		}
+
+		// Words appearing in the same order bonus
+		inputWords := strings.Fields(input)
+		if len(inputWords) > 1 {
+			allWordsFound := true
+			lastIndex := -1
+
+			for _, word := range inputWords {
+				idx := strings.Index(optionLower, word)
+				if idx == -1 || idx <= lastIndex {
+					allWordsFound = false
+					break
+				}
+				lastIndex = idx
+			}
+
+			if allWordsFound {
+				score += 0.15
+			}
+		}
+
+		// Cap at 1.0
+		if score > 1.0 {
+			score = 1.0
+		}
+
+		if score > bestScore {
+			bestScore = score
+			bestMatch = option
+		}
+	}
+
+	return bestMatch, bestScore
+}
+
+// calculateSimilarity computes a similarity score between two strings
+// using a combination of Levenshtein distance and other heuristics
+func calculateSimilarity(a, b string) float64 {
+	a = strings.ToLower(a)
+	b = strings.ToLower(b)
+
+	// If strings are identical, return perfect score
+	if a == b {
+		return 1.0
+	}
+
+	// Handle acronyms - if input might be an acronym of the target
+	// For example "tp" might match "triple platform"
+	if isAcronymOf(a, b) {
+		return 0.8
+	}
+
+	// Calculate Levenshtein distance
+	distance := levenshteinDistance(a, b)
+	maxLen := float64(max(len(a), len(b)))
+
+	// Convert distance to similarity score (0 to 1)
+	return 1.0 - float64(distance)/maxLen
+}
+
+// isAcronymOf checks if a might be an acronym of b
+func isAcronymOf(potentialAcronym, fullText string) bool {
+	if len(potentialAcronym) <= 1 {
+		return false
+	}
+
+	words := strings.Fields(fullText)
+	if len(potentialAcronym) != len(words) {
+		return false
+	}
+
+	for i, char := range potentialAcronym {
+		if i >= len(words) {
+			return false
+		}
+
+		if len(words[i]) == 0 || !strings.HasPrefix(strings.ToLower(words[i]), string(char)) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// levenshteinDistance calculates the Levenshtein distance between two strings
+func levenshteinDistance(a, b string) int {
+	if len(a) == 0 {
+		return len(b)
+	}
+	if len(b) == 0 {
+		return len(a)
+	}
+
+	// Create a matrix
+	matrix := make([][]int, len(a)+1)
+	for i := range matrix {
+		matrix[i] = make([]int, len(b)+1)
+		matrix[i][0] = i
+	}
+	for j := range matrix[0] {
+		matrix[0][j] = j
+	}
+
+	// Fill the matrix
+	for i := 1; i <= len(a); i++ {
+		for j := 1; j <= len(b); j++ {
+			cost := 1
+			if a[i-1] == b[j-1] {
+				cost = 0
+			}
+			matrix[i][j] = min(
+				matrix[i-1][j]+1,      // deletion
+				matrix[i][j-1]+1,      // insertion
+				matrix[i-1][j-1]+cost, // substitution
+			)
+		}
+	}
+
+	return matrix[len(a)][len(b)]
+}
+
+func calcSeedHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	logUserInteraction(i, "command", "calc")
+
+	defer func() {
+		if err := recover(); err != nil {
+			log.Errorf("application panicked while handling a request: %v", err)
+			s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+				Type: discordgo.InteractionResponseChannelMessageWithSource,
+				Data: &discordgo.InteractionResponseData{
+					Content: "Either you misspelled some room or the developer's an idiot. If it's the latter, go contact him and he'll fix me.",
+				},
+			})
+		}
+	}()
+
+	data := i.ApplicationCommandData()
+	selected := make([]string, 0, 8)
+
+	for _, option := range data.Options {
+		selected = append(selected, option.StringValue())
+	}
+
+	valid, err := validateInput(selected)
+	if !valid {
+		log.Error(err)
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: err.Error(),
+			},
+		})
+
+		return
+	}
+
+	res, err := calc.CalcSeed(selected)
+	if err != nil {
+		log.Error(err)
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "Go tell the developer he's an idiot 'cause something's broken idk",
+			},
+		})
+		return
+	}
+
+	initialResult := []calc.CalcSeedResult{res[0]}
+	img, err := drawCalcResults(selected, initialResult)
+	if err != nil {
+		log.Error(err)
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "Go tell the developer he's an idiot 'cause something's broken idk",
+			},
+		})
+		return
+	}
+
+	// Send initial response
+	err = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Files: []*discordgo.File{
+				{
+					Name:   "result.png",
+					Reader: bytes.NewReader(img.Bytes()),
+				},
+			},
+			Components: createNavigationButtons(0, len(res), ButtonAnyBoost),
+		},
+	})
+	if err != nil {
+		log.Error(err)
+		return
+	}
+
+	// Get the message ID from the response
+	message, err := s.InteractionResponse(i.Interaction)
+	if err != nil {
+		log.Errorf("Failed to get interaction response: %v", err)
+		return
+	}
+
+	// Store state with message ID
+	messageStates[message.ID] = &ResultState{
+		Rooms:   selected,
+		Results: res,
+		Index:   0,
+		Filter:  ButtonAnyBoost,
+	}
+
+	timer := cleanupMessageState(message.ID, s, message.ChannelID, true)
+	cleanupTimers[message.ID] = timer
+}
+
+func allSplitsHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	logUserInteraction(i, "command", "allsplits")
+
+	// Acknowledge the command
+	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{},
+	})
+	if err != nil {
+		log.Errorf("Failed to defer response: %v", err)
+		return
+	}
+
+	embed := createAllSplitsSummaryEmbed("all")
+	content := "Here's a summary of all room splits used in Parkour Duels Bot."
+
+	// Buttons row
+	buttons := discordgo.ActionsRow{
+		Components: []discordgo.MessageComponent{
+			discordgo.Button{
+				Label:    "All",
+				Style:    discordgo.PrimaryButton, // selected by default
+				CustomID: "allsplits_all",
+			},
+			discordgo.Button{
+				Label:    "Easy",
+				Style:    discordgo.SecondaryButton,
+				CustomID: "allsplits_easy",
+			},
+			discordgo.Button{
+				Label:    "Hard",
+				Style:    discordgo.SecondaryButton,
+				CustomID: "allsplits_hard",
+			},
+		},
+	}
+
+	_, err = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+		Content:    &content,
+		Embeds:     &[]*discordgo.MessageEmbed{embed},
+		Components: &[]discordgo.MessageComponent{buttons},
+	})
+	if err != nil {
+		log.Errorf("Failed to edit response with splits summary: %v", err)
+	}
+}
+
+
+func createAllSplitsSummaryEmbed(filter string) *discordgo.MessageEmbed {
+	type roomEntry struct {
+		Name string
+		Info calc.Room
+	}
+
+	var easyRooms, hardRooms []roomEntry
+	var finishRoom *roomEntry
+
+	// Separate rooms
+	for name, info := range calc.RoomMap {
+		if name == "finish room" {
+			finishRoom = &roomEntry{name, info}
+			continue
+		}
+
+		entry := roomEntry{name, info}
+		switch info.Difficulty {
+		case calc.Easy:
+			easyRooms = append(easyRooms, entry)
+		case calc.Hard:
+			hardRooms = append(hardRooms, entry)
+		}
+	}
+
+	sort.Slice(easyRooms, func(i, j int) bool { return easyRooms[i].Name < easyRooms[j].Name })
+	sort.Slice(hardRooms, func(i, j int) bool { return hardRooms[i].Name < hardRooms[j].Name })
+
+	var description strings.Builder
+	description.WriteString("```\n")
+	description.WriteString(fmt.Sprintf("%-18s %8s %8s %8s %8s\n", "Room", "Boostless", "Boost #1", "Boost #2", "Boost #3"))
+	description.WriteString(strings.Repeat("-", 50) + "\n")
+
+	writeRoomTable := func(rooms []roomEntry) {
+		prevGroup := ""
+		for _, entry := range rooms {
+			group := string(entry.Name[0])
+			if prevGroup != "" && group != prevGroup {
+				description.WriteString("\n")
+			}
+			prevGroup = group
+
+			roomName := entry.Name
+			if len(roomName) > 18 {
+				roomName = roomName[:15] + "..."
+			}
+
+			description.WriteString(fmt.Sprintf("%-18s %8.2f ", roomName, entry.Info.BoostlessTime))
+			for i := 0; i < 3; i++ {
+				if i < len(entry.Info.BoostStrats) {
+					description.WriteString(fmt.Sprintf("%8.2f", entry.Info.BoostStrats[i].Time))
+				} else {
+					description.WriteString(fmt.Sprintf("%8s", "---"))
+				}
+			}
+			description.WriteString("\n")
+		}
+		description.WriteString("\n")
+	}
+
+	switch filter {
+	case "Easy":
+		description.WriteString("EASY:\n")
+		writeRoomTable(easyRooms)
+	case "Hard":
+		description.WriteString("HARD:\n")
+		writeRoomTable(hardRooms)
+	default: // All
+		description.WriteString("EASY:\n")
+		writeRoomTable(easyRooms)
+		description.WriteString("HARD:\n")
+		writeRoomTable(hardRooms)
+		if finishRoom != nil {
+			description.WriteString("FINISH:\n")
+			writeRoomTable([]roomEntry{*finishRoom})
+		}
+	}
+
+	description.WriteString("```\nTimes shown are in seconds. Use `/calc` to calculate optimal routes.\n")
+
+	return &discordgo.MessageEmbed{
+		Title:       "PKD Room Splits Summary",
+		Description: description.String(),
+		Color:       0x45D3B3,
+		Footer: &discordgo.MessageEmbedFooter{
+			Text: "Values used in the calculation",
+		},
+	}
+}
+
+
+
+
+func autocompleteHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	log.Debug("Autocomplete handler triggered")
+
+	data := i.ApplicationCommandData()
+
+	// Track already-selected rooms
+	selectedOptions := make(map[string]bool)
+	for _, opt := range data.Options {
+		if !opt.Focused {
+			selectedOptions[opt.StringValue()] = true
+		}
+	}
+
+	// Find focused option
+	var focusedOption *discordgo.ApplicationCommandInteractionDataOption
+	for _, opt := range data.Options {
+		if opt.Focused {
+			focusedOption = opt
+			break
+		}
+	}
+
+	if focusedOption == nil {
+		return
+	}
+
+	searchTerm := strings.ToLower(focusedOption.StringValue())
+
+	// Extract room index from "room_1" .. "room_8"
+	re := regexp.MustCompile(`\d+`)
+	match := re.FindString(focusedOption.Name)
+	roomIndex := 0
+	if match != "" {
+		roomIndex, _ = strconv.Atoi(match)
+	}
+
+	// Determine allowed difficulty
+	var allowed calc.Difficulty
+	if roomIndex >= 1 && roomIndex <= 6 {
+		allowed = calc.Easy
+	} else {
+		allowed = calc.Hard
+	}
+
+
+	// Collect matching rooms
+	var filtered []string
+	for name, room := range calc.RoomMap {
+		if name == "finish room" {
+			continue
+		}
+		if room.Difficulty != allowed {
+			continue
+		}
+		if selectedOptions[name] {
+			continue
+		}
+		if searchTerm == "" || strings.Contains(strings.ToLower(name), searchTerm) {
+			filtered = append(filtered, name)
+		}
+	}
+
+	// Sort results
+	sort.Strings(filtered)
+
+	// Build choices (Discord max 25)
+	choices := make([]*discordgo.ApplicationCommandOptionChoice, 0, 25)
+	for _, r := range filtered {
+		choices = append(choices, &discordgo.ApplicationCommandOptionChoice{
+			Name:  r,
+			Value: r,
+		})
+		if len(choices) == 25 {
+			break
+		}
+	}
+
+	// Respond
+	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionApplicationCommandAutocompleteResult,
+		Data: &discordgo.InteractionResponseData{
+			Choices: choices,
+		},
+	})
+
+	if err != nil {
+		log.Errorf("Autocomplete response failed: %v", err)
+	}
+}
+
+
+func logUserInteraction(i *discordgo.InteractionCreate, interactionType string, actionName string) {
+	var username, nickname, userID string
+
+	// Get user ID
+	if i.User != nil {
+		// DM context
+		userID = i.User.ID
+		username = i.User.Username
+		nickname = username // No nicknames in DMs
+	} else if i.Member != nil {
+		// Guild context
+		userID = i.Member.User.ID
+		username = i.Member.User.Username
+
+		// Get nickname if available
+		if i.Member.Nick != "" {
+			nickname = i.Member.Nick
+		} else {
+			nickname = username
+		}
+	} else {
+		log.Warn("Could not identify user from interaction")
+		return
+	}
+
+	// Log the interaction with user details
+	log.Infof("User %s (%s, ID: %s) performed %s: %s",
+		nickname, username, userID, interactionType, actionName)
+
+	// If it's the ShowCalc button, log more details
+	if interactionType == "button click" && actionName == ButtonShowCalc {
+		log.Infof("User %s (%s) requested calculation details", nickname, userID)
+	}
+}
+
+func logBotPermissions() {
+	if s == nil || s.State == nil || s.State.User == nil {
+		log.Error("Discord session or user is not initialized, cannot check permissions")
+		return
+	}
+
+	log.Info("=== Checking Bot Permissions ===")
+	botID := s.State.User.ID
+	botUsername := s.State.User.Username
+
+	// Map to translate permission bits to readable names
+	permissionNames := map[int64]string{
+		discordgo.PermissionViewChannel:        "View Channels",
+		discordgo.PermissionSendMessages:       "Send Messages",
+		discordgo.PermissionAttachFiles:        "Attach Files",
+		discordgo.PermissionEmbedLinks:         "Embed Links",
+		discordgo.PermissionReadMessageHistory: "Read Message History",
+		discordgo.PermissionManageMessages:     "Manage Messages",
+		discordgo.PermissionMentionEveryone:    "Mention Everyone",
+		discordgo.PermissionManageChannels:     "Manage Channels",
+		discordgo.PermissionManageRoles:        "Manage Roles",
+		discordgo.PermissionKickMembers:        "Kick Members",
+		discordgo.PermissionBanMembers:         "Ban Members",
+		discordgo.PermissionAdministrator:      "Administrator",
+	}
+
+	// Check if GUILD_ID is set
+	if GuildID == "" {
+		log.Error("GUILD_ID is not set in environment variables, can't check permissions")
+		return
+	}
+
+	// Get the specific guild
+	guild, err := s.Guild(GuildID)
+	if err != nil {
+		log.Errorf("Could not get details for guild ID %s: %v", GuildID, err)
+		return
+	}
+
+	log.Infof("Bot %s#%s (ID: %s) checking permissions in server: %s",
+		botUsername, s.State.User.Discriminator, botID, guild.Name)
+
+	// Get bot's roles in this guild
+	botMember, err := s.GuildMember(GuildID, botID)
+	if err != nil {
+		log.Errorf("Could not get bot's member info in guild %s: %v", guild.Name, err)
+		return
+	}
+
+	// Get all roles to find bot's roles
+	roles, err := s.GuildRoles(GuildID)
+	if err != nil {
+		log.Errorf("Could not get roles for guild %s: %v", guild.Name, err)
+		return
+	}
+
+	// Log bot's role details
+	log.Info("Bot role details:")
+	for _, role := range roles {
+		for _, botRoleID := range botMember.Roles {
+			if role.ID == botRoleID {
+				log.Infof("  - Role: %s (ID: %s, Position: %d, Permissions: %d)",
+					role.Name, role.ID, role.Position, role.Permissions)
+
+				// Log human-readable permissions
+				var permissionsList []string
+				for bit, name := range permissionNames {
+					if role.Permissions&int64(bit) != 0 {
+						permissionsList = append(permissionsList, name)
+					}
+				}
+				log.Infof("    Permissions: %s", strings.Join(permissionsList, ", "))
+			}
+		}
+	}
+
+	// Check permissions in specific channels
+	channels, err := s.GuildChannels(GuildID)
+	if err != nil {
+		log.Errorf("Could not get channels for guild %s: %v", guild.Name, err)
+		return
+	}
+
+	// Filter for text channels only
+	var textChannels []*discordgo.Channel
+	for _, channel := range channels {
+		if channel.Type == discordgo.ChannelTypeGuildText {
+			textChannels = append(textChannels, channel)
+		}
+	}
+
+	log.Infof("Checking permissions in %d text channels", len(textChannels))
+
+	// Find #bot-commands channel specifically
+	var botCommandsChannel *discordgo.Channel
+	for _, channel := range textChannels {
+		if channel.Name == "bot-commands" {
+			botCommandsChannel = channel
+			break
+		}
+	}
+
+	// First check the bot-commands channel if found
+	if botCommandsChannel != nil {
+		perms, err := s.State.UserChannelPermissions(botID, botCommandsChannel.ID)
+		if err != nil {
+			log.Errorf("Error getting permissions for #bot-commands: %v", err)
+		} else {
+			log.Infof("=== #bot-commands Channel (ID: %s) ===", botCommandsChannel.ID)
+			logChannelPermissions(perms, permissionNames)
+
+			// Also store this ID for later use
+			BotCommandsChannelID = botCommandsChannel.ID
+		}
+	} else {
+		log.Warning("No #bot-commands channel found in this guild!")
+	}
+
+	// Log permissions for all text channels
+	for _, channel := range textChannels {
+		// Skip if this is the bot-commands channel we already checked
+		if botCommandsChannel != nil && channel.ID == botCommandsChannel.ID {
+			continue
+		}
+
+		perms, err := s.State.UserChannelPermissions(botID, channel.ID)
+		if err != nil {
+			log.Errorf("Error getting permissions for channel %s: %v", channel.Name, err)
+			continue
+		}
+
+		log.Infof("=== Channel: %s (ID: %s) ===", channel.Name, channel.ID)
+		logChannelPermissions(perms, permissionNames)
+	}
+
+	log.Info("=== Permission Check Complete ===")
+}
+
+// Helper function to log channel permissions
+func logChannelPermissions(perms int64, permissionNames map[int64]string) {
+	// Check critical permissions individually
+	criticalPerms := []int64{
+		discordgo.PermissionViewChannel,
+		discordgo.PermissionSendMessages,
+		discordgo.PermissionAttachFiles,
+	}
+
+	for _, perm := range criticalPerms {
+		if perms&perm != 0 {
+			log.Infof("  ✅ Has permission: %s", permissionNames[perm])
+		} else {
+			log.Errorf("  ❌ MISSING CRITICAL PERMISSION: %s", permissionNames[perm])
+		}
+	}
+
+	// Log all other permissions
+	log.Info("  Other permissions:")
+	for bit, name := range permissionNames {
+		// Skip the ones we already checked
+		if contains(criticalPerms, bit) {
+			continue
+		}
+
+		if perms&bit != 0 {
+			log.Infof("    ✓ %s", name)
+		}
+	}
+}
+
+// Helper function to check if a slice contains a value
+func contains(slice []int64, val int64) bool {
+	for _, item := range slice {
+		if item == val {
+			return true
+		}
+	}
+	return false
+}
