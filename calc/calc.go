@@ -50,9 +50,10 @@ var RoomMap = map[string]Room{
 	// Easy rooms
 	"1a": {Name: "1a", BoostlessTime: 13.6, Difficulty: Easy, BoostStrats: []BoostRoom{
 		{Name: "cp 1-2", Time: 10.6, BoostTime: 9.6, Quality: BestMove},
+		{Name: "cp 0-1", Time: 12.5, BoostTime: 4.2, Quality: BrilliantMove},
 	}},
 	"1b": {Name: "1b", BoostlessTime: 15.1, Difficulty: Easy, BoostStrats: []BoostRoom{
-		{Name: "cp 1-2", Time: 11.1, BoostTime: 8.1, Quality: BestMove},
+		{Name: "cp 1-2", Time: 10.8, BoostTime: 8.1, Quality: BestMove},
 		{Name: "cp 0-1", Time: 11.4, BoostTime: 3.2, Quality: BestMove},
 	}}, 
 	"1c": {Name: "1c", BoostlessTime: 11.4, Difficulty: Easy, BoostStrats: []BoostRoom{
@@ -61,6 +62,7 @@ var RoomMap = map[string]Room{
 	}},
 	"1d": {Name: "1d", BoostlessTime: 17.4, Difficulty: Easy, BoostStrats: []BoostRoom{
 		{Name: "cp 0-1", Time: 13.2, BoostTime: 5.5, Quality: BestMove},
+		{Name: "cp 1-2", Time: 15.6, BoostTime: 10.9, Quality: GreatMove},
 	}},
 	"1e": {Name: "1e", BoostlessTime: 14.9, Difficulty: Easy, BoostStrats: []BoostRoom{
 		{Name: "cp 1-2 (Late)", Time: 12.1, BoostTime: 10.2, Quality: GreatMove},
@@ -69,30 +71,39 @@ var RoomMap = map[string]Room{
 	
 	"2a": {Name: "2a", BoostlessTime: 13.6, Difficulty: Easy, BoostStrats: []BoostRoom{
 		{Name: "cp 1-2", Time: 11.6, BoostTime: 5.6, Quality: GreatMove},
+		{Name: "cp 0-1", Time: 12.5, BoostTime: 2.8, Quality: BrilliantMove},
 	}},
 	"2b": {Name: "2b", BoostlessTime: 16.9, Difficulty: Easy, BoostStrats: []BoostRoom{
 		{Name: "cp 1-2 (BIG JRGY)", Time: 12.4, BoostTime: 7.1, Quality: BrilliantMove},
+		{Name: "cp 2-3", Time: 13.9, BoostTime: 10.2, Quality: BestMove},
+		{Name: "cp 0-1", Time: 15.8, BoostTime: 3.3, Quality: BrilliantMove},
+
 	}},
 	"2c": {Name: "2c", BoostlessTime: 19.0, Difficulty: Easy, BoostStrats: []BoostRoom{
 		{Name: "cp 1-2", Time: 15.0, BoostTime: 4.2, Quality: BestMove},
 		{Name: "cp 2-3", Time: 15.0, BoostTime: 11.9, Quality: BestMove},
+		{Name: "cp 0-1", Time: 17.5, BoostTime: 0.7, Quality: GreatMove},
 	}},
 	"2d": {Name: "2d", BoostlessTime: 20.5, Difficulty: Easy, BoostStrats: []BoostRoom{
 		{Name: "cp 1-2", Time: 15.8, BoostTime: 6.5, Quality: BestMove},
+		{Name: "cp 2-3", Time: 17.8, BoostTime: 15.8 , Quality: GreatMove},
 	}},
 	"2e": {Name: "2e", BoostlessTime: 15.9, Difficulty: Easy, BoostStrats: []BoostRoom{
 		{Name: "cp 0-1", Time: 12.2, BoostTime: 2.6, Quality: BestMove},
+		{Name: "cp 1-2", Time: 13.7, BoostTime: 11.0, Quality: GreatMove},
 	}},
 
 	"3a": {Name: "3a", BoostlessTime: 15.2, Difficulty: Easy, BoostStrats: []BoostRoom{
 		{Name: "cp 0-1", Time: 11.7, BoostTime: 4.8, Quality: BestMove},
 	}},
 	"3b": {Name: "3b", BoostlessTime: 15.3, Difficulty: Easy, BoostStrats: []BoostRoom{
-		{Name: "cp 1-2", Time: 10.3, BoostTime: 9.5, Quality: BestMove},
+		{Name: "cp 1-2", Time: 10.4, BoostTime: 9.5, Quality: BestMove},
 		{Name: "cp 0-1", Time: 11.8, BoostTime: 3.6, Quality: GreatMove},
 	}},
 	"3c": {Name: "3c", BoostlessTime: 17.4, Difficulty: Easy, BoostStrats: []BoostRoom{
 		{Name: "cp 1-2", Time: 13.2, BoostTime: 7.4, Quality: BestMove},
+		{Name: "cp 0-1", Time: 16.1, BoostTime: 2.6, Quality: GreatMove},
+		{Name: "cp 2-3", Time: 16.1, BoostTime: 13.2, Quality: GreatMove},
 	}},
 	"3d": {Name: "3d", BoostlessTime: 26.9, Difficulty: Easy, BoostStrats: []BoostRoom{
 		{Name: "cp 0-1", Time: 20.6, BoostTime: 2.0, Quality: BestMove},
@@ -100,10 +111,12 @@ var RoomMap = map[string]Room{
 	}},
 	"3e": {Name: "3e", BoostlessTime: 15.6, Difficulty: Easy, BoostStrats: []BoostRoom{
 		{Name: "cp 1-2", Time: 11.0, BoostTime: 10.0, Quality: BestMove},
+		{Name: "cp 0-1", Time: 13.9, BoostTime: 1.9, Quality: GreatMove},
 	}},
 
 	"4a": {Name: "4a", BoostlessTime: 10.8, Difficulty: Easy, BoostStrats: []BoostRoom{
 		{Name: "cp 1-2", Time: 8.0, BoostTime: 5.9, Quality: BestMove},
+		{Name: "cp 0-1", Time: 9.8, BoostTime: 2.9, Quality: BrilliantMove},
 	}},
 	"4b": {Name: "4b", BoostlessTime: 17.8, Difficulty: Easy, BoostStrats: []BoostRoom{
 		{Name: "cp 1-2", Time: 13.6, BoostTime: 7.6, Quality: BestMove},
@@ -111,9 +124,11 @@ var RoomMap = map[string]Room{
 	}},
 	"4c": {Name: "4c", BoostlessTime: 14.7, Difficulty: Easy, BoostStrats: []BoostRoom{
 		{Name: "cp 1-2", Time: 11.7, BoostTime: 9.7, Quality: BestMove},
+		{Name: "cp 1-2", Time: 12.2, BoostTime: 2.0, Quality: GreatMove},
 	}},
 	"4e": {Name: "4e", BoostlessTime: 18.0, Difficulty: Easy, BoostStrats: []BoostRoom{
 		{Name: "cp 0-1", Time: 12.7, BoostTime: 3.0, Quality: BestMove},
+		{Name: "cp 1-2", Time: 16.5, BoostTime: 10.6, Quality: BrilliantMove},
 	}},
 
 	"5a": {Name: "5a", BoostlessTime: 14.9, Difficulty: Easy, BoostStrats: []BoostRoom{
@@ -121,15 +136,19 @@ var RoomMap = map[string]Room{
 	}},
 	"5b": {Name: "5b", BoostlessTime: 21.1, Difficulty: Easy, BoostStrats: []BoostRoom{
 		{Name: "cp 0-1", Time: 13.8, BoostTime: 6.1, Quality: BestMove},
+		{Name: "cp 1-2", Time: 17.3, BoostTime: 12.5, Quality: GreatMove},
 	}},
 	"5c": {Name: "5c", BoostlessTime: 20.1, Difficulty: Easy, BoostStrats: []BoostRoom{
 		{Name: "cp 2-3", Time: 16.6, BoostTime: 15.6, Quality: BestMove},
+		{Name: "cp 1-2", Time: 18.3, BoostTime: 7.0, Quality: BestMove},
+		{Name: "cp 0-1", Time: 18.5, BoostTime: 1.2, Quality: BestMove},
 	}},
 	"5d": {Name: "5d", BoostlessTime: 12.8, Difficulty: Easy, BoostStrats: []BoostRoom{
 		{Name: "cp 0-1", Time: 10.1, BoostTime: 3.3, Quality: BestMove},
 	}},
 	"5e": {Name: "5e", BoostlessTime: 17.6, Difficulty: Easy, BoostStrats: []BoostRoom{
-		{Name: "cp 0-1", Time: 13.2, BoostTime: 11.2, Quality: BestMove},
+		{Name: "cp 1-2", Time: 13.2, BoostTime: 11.2, Quality: BestMove},
+		{Name: "cp 0-1", Time: 15.7, BoostTime: 1.2, Quality: GreatMove},
 	}},
 
 	// Hard rooms
@@ -184,7 +203,7 @@ var RoomMap = map[string]Room{
 
 	// Finish room
 	"finish room": {Name: "finish room", BoostlessTime: 2, Difficulty: Easy, BoostStrats: []BoostRoom{
-		{Name: "lol", Time: 0.7, BoostTime: 0.3, Quality: BestMove},
+		{Name: "lol", Time: 1.3, BoostTime: 0.3, Quality: BestMove},
 	}},
 }
 

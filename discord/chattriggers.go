@@ -28,40 +28,20 @@ type BoostRoomsResponse struct {
 
 var seedCache = NewSeedCache(1 * time.Hour)
 
-// ------------------------
-// /allsplits handler
-// ------------------------
-func AllSplitsHandle(i *discordgo.InteractionCreate) (calc.CalcSeedResult, []BoostRoomsResponse, error) {
+func ChattriggersHandle(rooms []string, timeLeft, lobby, ign string, debug bool) (calc.CalcSeedResult, []BoostRoomsResponse, error) {
 	if s == nil {
 		return calc.CalcSeedResult{}, nil, fmt.Errorf("discord session is not initialized")
 	}
 
-	// Get filter option
-	filter := "all"
-	if len(i.ApplicationCommandData().Options) > 0 {
-		opt := i.ApplicationCommandData().Options[0]
-		filter = strings.ToLower(opt.StringValue())
-	}
-
-	// Get rooms from options
-	rooms := []string{}
-	for _, opt := range i.ApplicationCommandData().Options {
-		if opt.Name == "rooms" && len(opt.Options) > 0 {
-			for _, r := range opt.Options {
-				rooms = append(rooms, strings.ToLower(r.StringValue()))
-			}
-		}
-	}
-
-	// Apply room name mapping
 	for i, r := range rooms {
-		if mapped, exists := ct2blrk[r]; exists {
-			rooms[i] = mapped
+		blrkRoom, exists := ct2blrk[r]
+		if exists {
+			rooms[i] = blrkRoom
 		}
-	}
 
-	// Add finish room for calculation
-	roomsWithFinish := append(rooms, "finish room")
+		rooms[i] = strings.ToLower(rooms[i])
+	}
+	rooms = append(rooms, "finish room")
 
 	if BotCommandsChannelID == "" {
 		BotCommandsChannelID = GetChannelIDByName("bot-commands")
@@ -74,61 +54,31 @@ func AllSplitsHandle(i *discordgo.InteractionCreate) (calc.CalcSeedResult, []Boo
 		return calc.CalcSeedResult{}, nil, fmt.Errorf("permission error: %w", err)
 	}
 
-	// Calculate all splits
-	results, err := calc.CalcSeed(roomsWithFinish)
+	results, err := calc.CalcSeed(rooms)
 	if err != nil {
 		return calc.CalcSeedResult{}, nil, fmt.Errorf("error calculating seed: %w", err)
 	}
+
 	if len(results) == 0 {
-		return calc.CalcSeedResult{}, nil, fmt.Errorf("no results found")
+		return calc.CalcSeedResult{}, nil, fmt.Errorf("no results found for the given rooms")
 	}
 
 	bestResult := results[0]
 
-	// Filter rooms by option
-	filteredRooms := []string{}
-	for _, r := range rooms {
-		isEasy := calc.RoomMap[r].Difficulty == calc.Easy
-		isHard := calc.RoomMap[r].Difficulty == calc.Hard
+	seedKey := strings.Join(rooms, "|")
 
-		switch filter {
-		case "easy":
-			if isEasy {
-				filteredRooms = append(filteredRooms, r)
-			}
-		case "hard":
-			if isHard {
-				filteredRooms = append(filteredRooms, r)
-			}
-		default:
-			filteredRooms = append(filteredRooms, r)
-		}
-	}
+	if bestResult.BoostTime < 130 && !seedCache.HasSeen(seedKey) && !debug {
+		seedCache.MarkSeen(seedKey)
 
-
-	// Build BoostRoomsResponse
-	boostRooms := []BoostRoomsResponse{}
-	for _, room := range bestResult.BoostRooms {
-		name := calc.RoomMap[roomsWithFinish[room.Ind]].Name
-		strat := calc.RoomMap[roomsWithFinish[room.Ind]].BoostStrats[room.StratInd].Name
-		boostRooms = append(boostRooms, BoostRoomsResponse{
-			Name:     fmt.Sprintf("%s (%s)", name, strat),
-			Pacelock: room.Pacelock,
-			Index:    room.Ind,
-		})
-	}
-
-	// Send result to Discord
-	if bestResult.BoostTime < 130 && !seedCache.HasSeen(strings.Join(roomsWithFinish, "|")) {
-		seedCache.MarkSeen(strings.Join(roomsWithFinish, "|"))
-
-		img, err := drawCalcResults(roomsWithFinish, []calc.CalcSeedResult{bestResult})
+		img, err := drawCalcResults(rooms, []calc.CalcSeedResult{bestResult})
 		if err != nil {
 			return calc.CalcSeedResult{}, nil, fmt.Errorf("error drawing seed results: %w", err)
 		}
 
-		content := fmt.Sprintf("Found a %s seed!", FormatTime(bestResult.BoostTime))
-		calcCommand := createCalcCommand(filteredRooms)
+		content := fmt.Sprintf("%s has found a %s seed, %s requeues in %s",
+			ign, FormatTime(bestResult.BoostTime), lobby, timeLeft)
+
+		calcCommand := createCalcCommand(rooms[:len(rooms)-1]) // Exclude "finish room"
 
 		components := []discordgo.MessageComponent{
 			discordgo.ActionsRow{
@@ -161,26 +111,108 @@ func AllSplitsHandle(i *discordgo.InteractionCreate) (calc.CalcSeedResult, []Boo
 			},
 		})
 		if err != nil {
-			return calc.CalcSeedResult{}, nil, fmt.Errorf("error sending message: %w", err)
+			return calc.CalcSeedResult{}, nil, fmt.Errorf("error sending message to Discord: %w", err)
 		}
 
 		messageStates[message.ID] = &ResultState{
-			Rooms:       filteredRooms,
+			Rooms:       rooms[:len(rooms)-1],
 			Results:     []calc.CalcSeedResult{bestResult},
 			Index:       0,
 			Filter:      ButtonAnyBoost,
-			CalcCommand: calcCommand,
+			CalcCommand: calcCommand, // Store the calc command in the state
 		}
 
 		cleanupTimers[message.ID] = cleanupMessageState(message.ID, s, BotCommandsChannelID, true)
 	}
 
+	boostRooms := make([]BoostRoomsResponse, 0)
+	for _, room := range bestResult.BoostRooms {
+		boostRooms = append(boostRooms, BoostRoomsResponse{
+			Name:     fmt.Sprintf("%s (%s)", calc.RoomMap[rooms[room.Ind]].Name, calc.RoomMap[rooms[room.Ind]].BoostStrats[room.StratInd].Name),
+			Pacelock: room.Pacelock,
+			Index:    room.Ind,
+		})
+	}
+
 	return bestResult, boostRooms, nil
 }
 
-// ------------------------
-// Helpers (from your existing code)
-// ------------------------
+type PkdutilResult struct {
+	Best struct {
+		Result     calc.CalcSeedResult
+		BoostRooms []BoostRoomsResponse
+	}
+	Personal struct {
+		Result     calc.CalcSeedResult
+		BoostRooms []BoostRoomsResponse
+	}
+}
+
+func PkdutilsHandle(rooms []string, splits map[string]calc.Room) (PkdutilResult, error) {
+	if s == nil {
+		return PkdutilResult{}, fmt.Errorf("discord session is not initialized")
+	}
+
+	for i := range rooms {
+		rooms[i] = strings.ToLower(rooms[i])
+	}
+	rooms = append(rooms, "finish room")
+
+	// calc with calc splits first
+	results, err := calc.CalcSeed(rooms)
+	if err != nil {
+		return PkdutilResult{}, fmt.Errorf("error calculating seed: %w", err)
+	}
+
+	if len(results) == 0 {
+		return PkdutilResult{}, fmt.Errorf("no results found for the given rooms")
+	}
+
+	bestResult := results[0]
+
+	boostRooms := make([]BoostRoomsResponse, 0)
+	for _, room := range bestResult.BoostRooms {
+		boostRooms = append(boostRooms, BoostRoomsResponse{
+			Name:     fmt.Sprintf("%s (%s)", calc.RoomMap[rooms[room.Ind]].Name, calc.RoomMap[rooms[room.Ind]].BoostStrats[room.StratInd].Name),
+			Pacelock: room.Pacelock,
+			Index:    room.Ind,
+		})
+	}
+
+	// calc with personal splits next
+	personalResults, err := calc.CalcSeedCustom(rooms, splits)
+	if err != nil {
+		return PkdutilResult{}, fmt.Errorf("error calculating seed: %w", err)
+	}
+	log.Debugf("%+v", personalResults[0])
+
+	if len(personalResults) == 0 {
+		return PkdutilResult{}, fmt.Errorf("no results found for the given rooms")
+	}
+
+	personalResult := personalResults[0]
+
+	personalBoostRooms := make([]BoostRoomsResponse, 0)
+	for _, room := range personalResult.BoostRooms {
+		personalBoostRooms = append(personalBoostRooms, BoostRoomsResponse{
+			Name:     fmt.Sprintf("%s (%s)", calc.RoomMap[rooms[room.Ind]].Name, calc.RoomMap[rooms[room.Ind]].BoostStrats[room.StratInd].Name),
+			Pacelock: room.Pacelock,
+			Index:    room.Ind,
+		})
+	}
+
+	return PkdutilResult{
+		Best: struct {
+			Result     calc.CalcSeedResult
+			BoostRooms []BoostRoomsResponse
+		}{bestResult, boostRooms},
+		Personal: struct {
+			Result     calc.CalcSeedResult
+			BoostRooms []BoostRoomsResponse
+		}{personalResult, personalBoostRooms},
+	}, nil
+}
+
 func GetChannelIDByName(channelName string) string {
 	if s == nil {
 		log.Error("Discord session is not initialized")
@@ -265,7 +297,9 @@ func createCalcCommand(rooms []string) string {
 	commandParts = append(commandParts, "/calc")
 
 	for i, room := range rooms {
+		// Format room names for the command
 		roomName := room
+		// First letter uppercase for each room
 		if len(roomName) > 0 {
 			roomName = strings.ToUpper(roomName[:1]) + roomName[1:]
 		}

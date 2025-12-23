@@ -1,6 +1,8 @@
 package discord
 
 import (
+	"regexp"
+	"strconv"
 	"bytes"
 	"fmt"
 	"io"
@@ -12,11 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"regexp"
-	"strconv"
-
 	"pkd-bot/calc"
-
 	"pkd-bot/hypixel"
 	"pkd-bot/tournaments"
 
@@ -595,14 +593,13 @@ func buttonHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
 
 	state, exists := messageStates[i.Message.ID]
 	if !exists {
-		content := "This interaction has expired. Please run the command again."
-		_, err := s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
-			Content:    &content,
-			Components: &[]discordgo.MessageComponent{},
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "This interaction has expired. Please run the command again.",
+				Flags:   discordgo.MessageFlagsEphemeral,
+			},
 		})
-		if err != nil {
-			log.Errorf("Failed to edit expired interaction message: %v", err)
-		}
 		return
 	}
 
@@ -615,28 +612,29 @@ func buttonHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		return
 	}
 
-	// Reset timers if they exist
+	// Reset the cleanup timer
 	if timer, exists := cleanupTimers[i.Message.ID]; exists {
 		timer.Reset(5 * time.Minute)
 	}
+
 	if timer, exists := showCalcTimers[i.Message.ID]; exists {
 		timer.Reset(longButtonDuration)
 	}
 
-	// Handle button actions
-	switch i.MessageComponentData().CustomID {
-	case "allsplits_filter":
-		selected := i.MessageComponentData().Values[0] // "all", "easy", or "hard"
-		embed := createAllSplitsSummaryEmbed(selected)
-		_, err := s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
-			Embeds: &[]*discordgo.MessageEmbed{embed},
-		})
-		if err != nil {
-			log.Errorf("Failed to update allsplits embed: %v", err)
+	if i.MessageComponentData().CustomID == ButtonCopyCalcCommand {
+		state, exists := messageStates[i.Message.ID]
+		if !exists {
+			s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+				Type: discordgo.InteractionResponseChannelMessageWithSource,
+				Data: &discordgo.InteractionResponseData{
+					Content: "This interaction has expired. Please run the command again.",
+					Flags:   discordgo.MessageFlagsEphemeral,
+				},
+			})
+			return
 		}
-		return
 
-	case ButtonCopyCalcCommand:
+		// Send the calc command as an ephemeral message that the user can copy
 		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseChannelMessageWithSource,
 			Data: &discordgo.InteractionResponseData{
@@ -645,26 +643,31 @@ func buttonHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
 			},
 		})
 		return
+	}
 
-	case ButtonShowCalc:
+	if i.MessageComponentData().CustomID == ButtonShowCalc {
 		var result calc.CalcSeedResult
 		filteredResults := getFilteredResults(state)
 		if len(filteredResults) > 0 {
 			if state.Index < len(filteredResults) {
 				result = filteredResults[state.Index]
 			} else {
-				result = filteredResults[0]
+				result = filteredResults[0] // Fallback to first result if index is out of bounds
 			}
 		} else {
-			result = state.Results[0]
+			result = state.Results[0] // Fallback to first result in original results
 		}
 
+		// Create detailed calculation message
 		detailedCalc := formatDetailedCalculation(state.Rooms, result)
 
+		// Check if we already have a calculation message for this interaction
 		if calcMsgID, exists := showCalcMessages[i.Message.ID]; exists {
+			// Edit the existing message instead of sending a new one
 			_, err = s.ChannelMessageEdit(i.ChannelID, calcMsgID, detailedCalc)
 			if err != nil {
 				log.Errorf("Failed to edit calculation message: %v", err)
+				// If edit fails (message might be deleted), remove from map and send a new one
 				delete(showCalcMessages, i.Message.ID)
 				msg, err := s.ChannelMessageSend(i.ChannelID, detailedCalc)
 				if err == nil {
@@ -674,83 +677,103 @@ func buttonHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
 				}
 			}
 		} else {
+			// Send a new message with the calculation details
 			msg, err := s.ChannelMessageSend(i.ChannelID, detailedCalc)
 			if err != nil {
 				log.Errorf("Failed to send calculation details: %v", err)
 			} else {
+				// Store the message ID for future references
 				showCalcMessages[i.Message.ID] = msg.ID
 			}
 		}
 
+		// Edit the original interaction response to confirm
 		_, err = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{})
 		if err != nil {
 			log.Errorf("Failed to edit interaction response: %v", err)
 		}
+
 		return
+	}
 
-	case "allsplits_all", "allsplits_easy", "allsplits_hard":
-		filter := ""
-		switch i.MessageComponentData().CustomID {
-		case "allsplits_all":
-			filter = "all"
-		case "allsplits_easy":
-			filter = "Easy"
-		case "allsplits_hard":
-			filter = "Hard"
+	switch i.MessageComponentData().CustomID {
+	case ButtonPrevious:
+		if state.Index > 0 {
+			state.Index--
+		}
+	case ButtonNext:
+		if state.Index < len(getFilteredResults(state))-1 {
+			state.Index++
 		}
 
-		embed := createAllSplitsSummaryEmbed(filter)
-		buttons := discordgo.ActionsRow{
-			Components: []discordgo.MessageComponent{
-				discordgo.Button{Label: "All", Style: discordgo.SecondaryButton, CustomID: "allsplits_all"},
-				discordgo.Button{Label: "Easy", Style: discordgo.SecondaryButton, CustomID: "allsplits_easy"},
-				discordgo.Button{Label: "Hard", Style: discordgo.SecondaryButton, CustomID: "allsplits_hard"},
-			},
-		}
+		// Check if the current result has a boost time >= boostless time
+		filteredResults := getFilteredResults(state)
+		if len(filteredResults) > 0 && state.Index < len(filteredResults) {
+			result := filteredResults[state.Index]
 
-		// Highlight selected button
-		for idx, comp := range buttons.Components {
-			if btn, ok := comp.(discordgo.Button); ok {
-				switch filter {
-				case "all":
-					if idx == 0 {
-						btn.Style = discordgo.PrimaryButton
-					}
-				case "Easy":
-					if idx == 1 {
-						btn.Style = discordgo.PrimaryButton
-					}
-				case "Hard":
-					if idx == 2 {
-						btn.Style = discordgo.PrimaryButton
-					}
+			// Calculate boostless time
+			boostlessTime := 0.0
+			for _, room := range state.Rooms {
+				roomInfo := calc.RoomMap[room]
+				boostlessTime += roomInfo.BoostlessTime
+			}
+
+			// Get boost time from the result
+			boostTime := result.BoostTime
+
+			// If boost time >= boostless time, remove buttons and image and send text message
+			if boostTime >= boostlessTime {
+				response := "Just play boostless at this point bro like why do you even bother with boosts 🤔"
+
+				// Update the message to remove components and image
+				_, err := s.ChannelMessageEditComplex(&discordgo.MessageEdit{
+					ID:          i.Message.ID,
+					Channel:     i.ChannelID,
+					Content:     &response,
+					Components:  &[]discordgo.MessageComponent{},
+					Attachments: &[]*discordgo.MessageAttachment{},
+				})
+				if err != nil {
+					log.Errorf("Failed to update message: %v", err)
+					return
 				}
-				buttons.Components[idx] = btn // put the modified button back
+
+				// Delete state since we're done with this interaction
+				delete(messageStates, i.Message.ID)
+				delete(showCalcMessages, i.Message.ID) // Clean up calculation message reference
+				if timer, exists := cleanupTimers[i.Message.ID]; exists {
+					timer.Stop()
+					delete(cleanupTimers, i.Message.ID)
+				}
+				if timer, exists := showCalcTimers[i.Message.ID]; exists {
+					timer.Stop()
+					delete(showCalcTimers, i.Message.ID)
+				}
+
+				// Confirm interaction is complete
+				_, err = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{})
+				if err != nil {
+					log.Errorf("Failed to edit interaction response: %v", err)
+				}
+
+				return
 			}
 		}
-
-
-		_, err := s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
-			Embeds:     &[]*discordgo.MessageEmbed{embed},
-			Components: &[]discordgo.MessageComponent{buttons},
-		})
-		if err != nil {
-			log.Errorf("Failed to update allsplits embed: %v", err)
-		}
-		return
-
 	case ButtonTwoBoost, ButtonThreeBoost, ButtonAnyBoost:
 		state.Filter = i.MessageComponentData().CustomID
 		state.Index = 0
 	}
 
-	// Handle general result drawing
+	// Get filtered results
 	filteredResults := getFilteredResults(state)
+
+	// Make sure we have results to display
 	if len(filteredResults) == 0 {
 		log.Error("No results available after filtering")
 		return
 	}
 
+	// Draw new image for the current index
 	currentResult := []calc.CalcSeedResult{filteredResults[state.Index]}
 	img, err := drawCalcResults(state.Rooms, currentResult)
 	if err != nil {
@@ -758,7 +781,9 @@ func buttonHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		return
 	}
 
+	// Create navigation buttons with updated state
 	navButtons := createNavigationButtons(state.Index, len(filteredResults), state.Filter)
+
 	_, err = s.ChannelMessageEditComplex(&discordgo.MessageEdit{
 		ID:          i.Message.ID,
 		Channel:     i.ChannelID,
@@ -771,14 +796,15 @@ func buttonHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		return
 	}
 
+	// Follow up with the interaction to confirm it's complete
 	_, err = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{})
 	if err != nil {
 		log.Errorf("Failed to edit interaction response: %v", err)
 	}
 
+	// Update the state in our map
 	messageStates[i.Message.ID] = state
 }
-
 
 func formatDetailedCalculation(rooms []string, result calc.CalcSeedResult) string {
 	rooms = append(rooms, "finish room")
@@ -836,11 +862,6 @@ func formatDetailedCalculation(rooms []string, result calc.CalcSeedResult) strin
 		boostCalc.WriteString(boostLine.String())
 
 		if i == 0 {
-			boostlessCalc.WriteString(fmt.Sprintf(" - %5.2f (accounting for r1)", 0.3))
-			boostCalc.WriteString(fmt.Sprintf(" - %5.2f (accounting for r1)", 0.3))
-
-			boostlessTimeSum -= 0.3
-			boostTimeSum -= 0.3
 		} else {
 			prevRoom := rooms[i-1]
 
@@ -1212,7 +1233,7 @@ func calcSeedHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
 func allSplitsHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	logUserInteraction(i, "command", "allsplits")
 
-	// Acknowledge the command
+	// First, respond to acknowledge the command
 	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{},
@@ -1222,42 +1243,23 @@ func allSplitsHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		return
 	}
 
-	embed := createAllSplitsSummaryEmbed("all")
+	// Create an embed with a summary table
+	embed := createAllSplitsSummaryEmbed()
+
+	// Create message content introducing the embed
 	content := "Here's a summary of all room splits used in Parkour Duels Bot."
 
-	// Buttons row
-	buttons := discordgo.ActionsRow{
-		Components: []discordgo.MessageComponent{
-			discordgo.Button{
-				Label:    "All",
-				Style:    discordgo.PrimaryButton, // selected by default
-				CustomID: "allsplits_all",
-			},
-			discordgo.Button{
-				Label:    "Easy",
-				Style:    discordgo.SecondaryButton,
-				CustomID: "allsplits_easy",
-			},
-			discordgo.Button{
-				Label:    "Hard",
-				Style:    discordgo.SecondaryButton,
-				CustomID: "allsplits_hard",
-			},
-		},
-	}
-
+	// Send the response
 	_, err = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
-		Content:    &content,
-		Embeds:     &[]*discordgo.MessageEmbed{embed},
-		Components: &[]discordgo.MessageComponent{buttons},
+		Content: &content,
+		Embeds:  &[]*discordgo.MessageEmbed{embed},
 	})
 	if err != nil {
 		log.Errorf("Failed to edit response with splits summary: %v", err)
 	}
 }
 
-
-func createAllSplitsSummaryEmbed(filter string) *discordgo.MessageEmbed {
+func createAllSplitsSummaryEmbed() *discordgo.MessageEmbed {
 	type roomEntry struct {
 		Name string
 		Info calc.Room
@@ -1266,11 +1268,11 @@ func createAllSplitsSummaryEmbed(filter string) *discordgo.MessageEmbed {
 	var easyRooms, hardRooms []roomEntry
 	var finishRoom *roomEntry
 
-	// Separate rooms
+	// Separate rooms into EASY, HARD, and FINISH
 	for name, info := range calc.RoomMap {
 		if name == "finish room" {
 			finishRoom = &roomEntry{name, info}
-			continue
+			continue // skip adding to easy/hard lists
 		}
 
 		entry := roomEntry{name, info}
@@ -1282,6 +1284,7 @@ func createAllSplitsSummaryEmbed(filter string) *discordgo.MessageEmbed {
 		}
 	}
 
+	// Sort rooms alphabetically
 	sort.Slice(easyRooms, func(i, j int) bool { return easyRooms[i].Name < easyRooms[j].Name })
 	sort.Slice(hardRooms, func(i, j int) bool { return hardRooms[i].Name < hardRooms[j].Name })
 
@@ -1293,7 +1296,9 @@ func createAllSplitsSummaryEmbed(filter string) *discordgo.MessageEmbed {
 	writeRoomTable := func(rooms []roomEntry) {
 		prevGroup := ""
 		for _, entry := range rooms {
-			group := string(entry.Name[0])
+			group := string(entry.Name[0]) // first character of room, e.g., '1' from '1a'
+
+			// Insert blank line when the group changes (except before the first group)
 			if prevGroup != "" && group != prevGroup {
 				description.WriteString("\n")
 			}
@@ -1317,22 +1322,18 @@ func createAllSplitsSummaryEmbed(filter string) *discordgo.MessageEmbed {
 		description.WriteString("\n")
 	}
 
-	switch filter {
-	case "Easy":
-		description.WriteString("EASY:\n")
-		writeRoomTable(easyRooms)
-	case "Hard":
-		description.WriteString("HARD:\n")
-		writeRoomTable(hardRooms)
-	default: // All
-		description.WriteString("EASY:\n")
-		writeRoomTable(easyRooms)
-		description.WriteString("HARD:\n")
-		writeRoomTable(hardRooms)
-		if finishRoom != nil {
-			description.WriteString("FINISH:\n")
-			writeRoomTable([]roomEntry{*finishRoom})
-		}
+	// EASY
+	description.WriteString("EASY:\n")
+	writeRoomTable(easyRooms)
+
+	// HARD
+	description.WriteString("HARD:\n")
+	writeRoomTable(hardRooms)
+
+	// FINISH
+	if finishRoom != nil {
+		description.WriteString("FINISH:\n")
+		writeRoomTable([]roomEntry{*finishRoom})
 	}
 
 	description.WriteString("```\nTimes shown are in seconds. Use `/calc` to calculate optimal routes.\n")
@@ -1346,8 +1347,6 @@ func createAllSplitsSummaryEmbed(filter string) *discordgo.MessageEmbed {
 		},
 	}
 }
-
-
 
 
 func autocompleteHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
@@ -1412,6 +1411,7 @@ func autocompleteHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		}
 	}
 
+
 	// Sort results
 	sort.Strings(filtered)
 
@@ -1439,6 +1439,7 @@ func autocompleteHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		log.Errorf("Autocomplete response failed: %v", err)
 	}
 }
+
 
 
 func logUserInteraction(i *discordgo.InteractionCreate, interactionType string, actionName string) {
